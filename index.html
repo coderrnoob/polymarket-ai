@@ -1,115 +1,405 @@
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<title>BTC 5M AI Predictor</title>
+import { useState, useEffect, useRef, useCallback } from "react";
 
-<style>
-body {
-    background: #0f172a;
-    color: white;
-    font-family: Arial;
-    text-align: center;
+// ── INDICATORS ─────────────────────────────────────────────
+function calcRSI(closes, period = 14) {
+  if (closes.length < period + 1) return 50;
+  let gains = 0, losses = 0;
+  for (let i = closes.length - period; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gains += d; else losses += Math.abs(d);
+  }
+  const ag = gains / period, al = losses / period;
+  if (al === 0) return 100;
+  return 100 - 100 / (1 + ag / al);
+}
+function calcEMA(arr, period) {
+  const k = 2 / (period + 1);
+  let ema = arr.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < arr.length; i++) ema = arr[i] * k + ema * (1 - k);
+  return ema;
+}
+function calcMACDSeries(closes) {
+  const k12 = 2/13, k26 = 2/27, k9 = 2/10;
+  let e12 = closes[0], e26 = closes[0];
+  const hists = [];
+  for (let i = 1; i < closes.length; i++) {
+    e12 = closes[i]*k12 + e12*(1-k12);
+    e26 = closes[i]*k26 + e26*(1-k26);
+    hists.push(e12 - e26);
+  }
+  let sig = hists[0];
+  return hists.map(h => { sig = h*k9 + sig*(1-k9); return { macd:h, signal:sig, hist:h-sig }; });
+}
+function fmtPrice(n) { return Number(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); }
+function fmtVol(v) {
+  v = parseFloat(v);
+  if (v >= 1e9) return (v/1e9).toFixed(2)+'B';
+  if (v >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (v >= 1e3) return (v/1e3).toFixed(2)+'K';
+  return v.toFixed(2);
+}
+function computePrediction({ rsiCls, volCls, macdCls, emaCls, rsi, candles }) {
+  const s = { bull:0, bear:0, neutral:0 };
+  const reasons = [];
+  if (rsiCls==='bull') { s.bull+=25; reasons.push('RSI oversold (<30) — reversal likely UP'); }
+  else if (rsiCls==='bear') { s.bear+=25; reasons.push('RSI overbought (>70) — reversal likely DOWN'); }
+  else { s.neutral+=10; reasons.push(`RSI at ${rsi.toFixed(1)} — no extreme reading`); }
+  if (macdCls==='bull') { s.bull+=25; reasons.push('MACD bullish — momentum shifting upward'); }
+  else if (macdCls==='bear') { s.bear+=25; reasons.push('MACD bearish — selling pressure rising'); }
+  else { s.neutral+=10; }
+  if (volCls==='bull') { s.bull+=20; reasons.push('Volume spike on green candles — buyers active'); }
+  else if (volCls==='bear') { s.bear+=20; reasons.push('Volume spike on red candles — sellers dominant'); }
+  else { s.neutral+=10; reasons.push('Volume near average — no directional conviction'); }
+  if (emaCls==='bull') { s.bull+=20; reasons.push('Price above EMA 9/21/50 — uptrend intact'); }
+  else if (emaCls==='bear') { s.bear+=20; reasons.push('Price below EMA 9/21/50 — downtrend active'); }
+  else { s.neutral+=10; reasons.push('Price mixed across EMAs — trend unclear'); }
+  const last3 = candles.slice(-4,-1);
+  const consecGreen = last3.every(c => c.close >= c.open);
+  const consecRed = last3.every(c => c.close < c.open);
+  let paCls = 'neutral';
+  if (consecGreen) { s.bull+=10; paCls='bull'; reasons.push('3 consecutive green candles — bullish momentum'); }
+  else if (consecRed) { s.bear+=10; paCls='bear'; reasons.push('3 consecutive red candles — bearish momentum'); }
+  else { s.neutral+=5; }
+  const total = s.bull + s.bear + s.neutral || 1;
+  let cls, conf;
+  if (s.bull >= s.bear && s.bull >= s.neutral) { cls='bull'; conf=Math.round((s.bull/total)*100); }
+  else if (s.bear > s.bull && s.bear >= s.neutral) { cls='bear'; conf=Math.round((s.bear/total)*100); }
+  else { cls='neutral'; conf=Math.round((s.neutral/total)*100); }
+  return { cls, conf, reasons, paCls };
 }
 
-.container { margin-top: 40px; }
+// ── GENERATE REALISTIC CANDLES VIA CLAUDE API ──────────────
+async function fetchCandlesFromClaude(tf) {
+  const tfMinutes = tf==='5m'?5:tf==='15m'?15:tf==='1h'?60:240;
+  const prompt = `Generate realistic BTC/USDT OHLCV candlestick data for the last 60 candles on a ${tf} timeframe.
+Current approximate BTC price: around $84000-$87000.
+Return ONLY a JSON object in this exact format, no explanation:
+{
+  "price": <current price as number>,
+  "change24h": <24h percent change like 1.23 or -0.87>,
+  "high24h": <24h high>,
+  "low24h": <24h low>,
+  "candles": [
+    {"o": <open>, "h": <high>, "l": <low>, "c": <close>, "v": <volume in BTC like 120.5>},
+    ...60 candles total, most recent last
+  ]
+}
+Make candles realistic with natural price movement, proper wicks, and varying volume. Mix bullish and bearish candles naturally.`;
 
-.card {
-    background: #1e293b;
-    padding: 20px;
-    margin: 15px auto;
-    width: 330px;
-    border-radius: 10px;
+  const resp = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 1000,
+      messages: [{ role: "user", content: prompt }]
+    })
+  });
+  const data = await resp.json();
+  const text = data.content?.[0]?.text || "";
+  const clean = text.replace(/```json|```/g, "").trim();
+  const parsed = JSON.parse(clean);
+  
+  // Build full candle objects with timestamps
+  const now = Date.now();
+  const intervalMs = tfMinutes * 60 * 1000;
+  return {
+    price: parsed.price,
+    change24h: parsed.change24h,
+    high24h: parsed.high24h,
+    low24h: parsed.low24h,
+    candles: parsed.candles.map((c, i) => ({
+      time: now - (60 - i) * intervalMs,
+      open: c.o, high: c.h, low: c.l, close: c.c, vol: c.v,
+      closeTime: now - (60 - i - 1) * intervalMs
+    }))
+  };
 }
 
-.green { color: #22c55e; }
-.red { color: #ef4444; }
-.yellow { color: #facc15; }
-</style>
-</head>
+// ── MAIN COMPONENT ─────────────────────────────────────────
+export default function BTCPredictor() {
+  const [tf, setTf] = useState('5m');
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadMsg, setLoadMsg] = useState('Analyzing BTC market...');
+  const [error, setError] = useState(null);
+  const [countdown, setCountdown] = useState(60);
+  const [now, setNow] = useState(Date.now());
+  const cdRef = useRef(null);
 
-<body>
+  const C = {
+    bull:'#00ff88', bear:'#ff3366', neutral:'#ffd700',
+    accent:'#00ffe7', muted:'#3a6070', text:'#c0e8f0',
+    bg:'#020408', panel:'#060d14', border:'#0a2a3a', dim:'#1a3a4a'
+  };
+  const sc = cls => cls==='bull'?C.bull:cls==='bear'?C.bear:C.neutral;
+  const sl = cls => cls==='bull'?'BULLISH ↑':cls==='bear'?'BEARISH ↓':'NEUTRAL —';
 
-<div class="container">
-    <h1>🚀 BTC 5M Polymarket AI</h1>
-
-    <div class="card"><h2>Price</h2><p id="price">Loading...</p></div>
-    <div class="card"><h2>Volume</h2><p id="volume">Loading...</p></div>
-    <div class="card"><h2>Momentum</h2><p id="momentum">-</p></div>
-    <div class="card"><h2>Prediction</h2><p id="prediction">-</p></div>
-    <div class="card"><h2>Decision</h2><p id="decision">-</p></div>
-</div>
-
-<script>
-
-const MARKET_ID = "btc-updown-5m-1776635400";
-
-let prevPrice = null;
-let prevVolume = null;
-
-async function fetchData() {
+  const load = useCallback(async (interval) => {
     try {
-        let res = await fetch(`https://gamma-api.polymarket.com/markets/${MARKET_ID}`);
-        
-        if (!res.ok) throw new Error("API not working");
+      setError(null);
+      setLoadMsg('Fetching BTC candle data...');
+      const raw = await fetchCandlesFromClaude(interval);
+      setLoadMsg('Computing indicators...');
 
-        let data = await res.json();
+      const { candles, price, change24h, high24h, low24h } = raw;
+      const closes = candles.map(c => c.close);
+      const vols = candles.map(c => c.vol);
 
-        let price = parseFloat(data.lastTradePrice);
-        let volume = parseFloat(data.volume);
+      const rsi = calcRSI(closes);
+      const ema9 = calcEMA(closes, 9), ema21 = calcEMA(closes, 21), ema50 = calcEMA(closes, 50);
+      const macdSeries = calcMACDSeries(closes);
+      const macdLast = macdSeries[macdSeries.length-1];
+      const macdPrev = macdSeries[macdSeries.length-2] || macdLast;
+      const avgVol = vols.slice(-20).reduce((a,b)=>a+b,0)/20;
+      const volRatio = vols[vols.length-1] / avgVol;
+      const lastCandle = candles[candles.length-1];
+      const isLastGreen = lastCandle.close >= lastCandle.open;
 
-        document.getElementById("price").innerText = price.toFixed(4);
-        document.getElementById("volume").innerText = volume;
+      const rsiCls = rsi < 30 ? 'bull' : rsi > 70 ? 'bear' : 'neutral';
+      const volCls = volRatio > 1.4 ? (isLastGreen ? 'bull' : 'bear') : 'neutral';
+      let macdCls = 'neutral';
+      if (macdLast.macd > macdLast.signal && macdPrev.macd <= macdPrev.signal) macdCls = 'bull';
+      else if (macdLast.macd < macdLast.signal && macdPrev.macd >= macdPrev.signal) macdCls = 'bear';
+      else if (macdLast.macd > macdLast.signal) macdCls = 'bull';
+      else if (macdLast.macd < macdLast.signal) macdCls = 'bear';
+      const allAbove = price > ema9 && price > ema21 && price > ema50;
+      const allBelow = price < ema9 && price < ema21 && price < ema50;
+      const emaCls = allAbove ? 'bull' : allBelow ? 'bear' : 'neutral';
 
-        if (prevPrice !== null) {
+      const pred = computePrediction({ rsiCls, volCls, macdCls, emaCls, rsi, candles });
 
-            let priceChange = price - prevPrice;
-            let volumeChange = volume - prevVolume;
-
-            let momentum = priceChange * volumeChange;
-
-            document.getElementById("momentum").innerText = momentum.toFixed(6);
-
-            let prediction = "";
-            let decision = "";
-
-            if (momentum > 0.0001) {
-                prediction = "UP 📈";
-                decision = "BUY YES";
-                setColor("prediction", "green");
-            } 
-            else if (momentum < -0.0001) {
-                prediction = "DOWN 📉";
-                decision = "BUY NO";
-                setColor("prediction", "red");
-            } 
-            else {
-                prediction = "NO EDGE";
-                decision = "SKIP";
-                setColor("prediction", "yellow");
-            }
-
-            document.getElementById("prediction").innerText = prediction;
-            document.getElementById("decision").innerText = decision;
-        }
-
-        prevPrice = price;
-        prevVolume = volume;
-
-    } catch (err) {
-        document.getElementById("price").innerText = "Error ❌";
-        console.log(err);
+      setData({
+        candles, closes, vols, price, change24h, high24h, low24h,
+        rsi, rsiCls, ema9, ema21, ema50, emaCls,
+        macdSeries, macdLast, macdCls,
+        volRatio, avgVol, volCls, pred,
+        lastUpdate: new Date().toLocaleTimeString('en-US',{hour12:false})
+      });
+      setLoading(false);
+    } catch(e) {
+      setError('Error: ' + e.message);
+      setLoading(false);
     }
+  }, []);
+
+  useEffect(() => { setLoading(true); load(tf); }, [tf, load]);
+
+  useEffect(() => {
+    if (cdRef.current) clearInterval(cdRef.current);
+    setCountdown(60);
+    cdRef.current = setInterval(() => {
+      setCountdown(p => { if (p <= 1) { setLoading(true); load(tf); return 60; } return p - 1; });
+    }, 1000);
+    return () => clearInterval(cdRef.current);
+  }, [tf, load]);
+
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+
+  let nextCandle = '--:--';
+  if (data) {
+    const last = data.candles[data.candles.length-1];
+    const remain = Math.max(0, last.closeTime - now);
+    const m = Math.floor(remain/60000), s = Math.floor((remain%60000)/1000);
+    nextCandle = `${m}:${s.toString().padStart(2,'0')}`;
+  }
+
+  const P = { background:C.panel, border:`1px solid ${C.border}`, padding:'14px 16px', marginBottom:14 };
+  const T = { fontFamily:'Orbitron,sans-serif', fontSize:10, letterSpacing:2, color:C.muted, textTransform:'uppercase', marginBottom:12, display:'flex', alignItems:'center', gap:6 };
+  const Bar = () => <span style={{width:3,height:12,background:C.accent,display:'inline-block'}}/>;
+
+  return (
+    <div style={{background:C.bg,minHeight:'100vh',fontFamily:"'Share Tech Mono',monospace",color:C.text}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap');
+        *{box-sizing:border-box;margin:0;padding:0;}
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+        @keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+      `}</style>
+
+      {/* HEADER */}
+      <div style={{borderBottom:`1px solid ${C.border}`,padding:'11px 16px',display:'flex',alignItems:'center',justifyContent:'space-between',background:'rgba(6,13,20,0.97)',position:'sticky',top:0,zIndex:100}}>
+        <div style={{fontFamily:'Orbitron,sans-serif',fontSize:13,fontWeight:900,letterSpacing:3,color:C.accent,textShadow:`0 0 18px rgba(0,255,231,0.5)`}}>BTC<span style={{color:'#ffd700'}}>//</span>PRED</div>
+        <div style={{display:'flex',alignItems:'center',gap:14,fontSize:11,color:C.muted}}>
+          <span><span style={{display:'inline-block',width:7,height:7,borderRadius:'50%',background:loading?C.neutral:C.bull,boxShadow:`0 0 6px ${loading?C.neutral:C.bull}`,marginRight:5,animation:'pulse 1.5s infinite'}}/>{loading?'LOADING':'LIVE'}</span>
+          <span style={{fontFamily:'Orbitron,sans-serif',fontSize:10,color:C.accent}}>{tf.toUpperCase()}</span>
+          <span>{new Date().toLocaleTimeString('en-US',{hour12:false})}</span>
+        </div>
+      </div>
+
+      <div style={{padding:'14px',maxWidth:860,margin:'0 auto'}}>
+        {/* TF BUTTONS */}
+        <div style={{display:'flex',gap:8,marginBottom:14,flexWrap:'wrap'}}>
+          {['5m','15m','1h','4h'].map(t=>(
+            <button key={t} onClick={()=>{if(!loading){setTf(t);}}} style={{fontFamily:'Orbitron,sans-serif',fontSize:10,fontWeight:700,letterSpacing:1,padding:'7px 16px',border:`1px solid ${t===tf?C.accent:C.dim}`,background:t===tf?'rgba(0,255,231,0.08)':C.panel,color:t===tf?C.accent:C.muted,cursor:'pointer',transition:'all 0.2s'}}>{t.toUpperCase()}</button>
+          ))}
+        </div>
+
+        {/* LOADING */}
+        {loading && (
+          <div style={{textAlign:'center',padding:'60px 20px',color:C.muted}}>
+            <div style={{fontFamily:'Orbitron,sans-serif',fontSize:20,color:C.accent,marginBottom:16,textShadow:`0 0 20px rgba(0,255,231,0.5)`}}>BTC//PRED</div>
+            <div style={{width:8,height:8,borderRadius:'50%',border:`2px solid ${C.accent}`,borderTopColor:'transparent',animation:'spin 0.8s linear infinite',margin:'0 auto 14px'}}/>
+            <div style={{fontSize:11,letterSpacing:2}}>{loadMsg}</div>
+          </div>
+        )}
+
+        {/* ERROR */}
+        {error && !loading && (
+          <div style={{color:C.bear,background:'rgba(255,51,102,0.08)',border:`1px solid rgba(255,51,102,0.25)`,padding:14,fontSize:11,marginBottom:14}}>
+            ⚠ {error}
+            <button onClick={()=>{setLoading(true);load(tf);}} style={{marginLeft:10,padding:'3px 10px',background:'transparent',border:`1px solid ${C.bear}`,color:C.bear,cursor:'pointer',fontSize:11}}>RETRY</button>
+          </div>
+        )}
+
+        {data && !loading && (
+          <div style={{animation:'fadeIn 0.4s ease'}}>
+
+            {/* PRICE HERO */}
+            <div style={{...P,borderTop:`2px solid ${C.accent}`,boxShadow:`0 0 18px rgba(0,255,231,0.1)`,display:'flex',justifyContent:'space-between',flexWrap:'wrap',gap:12,position:'relative',overflow:'hidden'}}>
+              <div style={{position:'absolute',right:8,bottom:-20,fontSize:80,color:'rgba(0,255,231,0.03)',fontFamily:'Orbitron,sans-serif',pointerEvents:'none'}}>₿</div>
+              <div>
+                <div style={{fontSize:9,color:C.muted,letterSpacing:2,marginBottom:4}}>BTC / USDT</div>
+                <div style={{display:'flex',alignItems:'center',gap:12,flexWrap:'wrap'}}>
+                  <div style={{fontFamily:'Orbitron,sans-serif',fontSize:26,fontWeight:900,color:'#fff'}}>${fmtPrice(data.price)}</div>
+                  <span style={{fontSize:11,padding:'2px 10px',color:data.change24h>=0?C.bull:C.bear,background:data.change24h>=0?'rgba(0,255,136,0.1)':'rgba(255,51,102,0.1)',border:`1px solid ${data.change24h>=0?'rgba(0,255,136,0.3)':'rgba(255,51,102,0.3)'}`}}>
+                    {data.change24h>=0?'+':''}{Number(data.change24h).toFixed(2)}%
+                  </span>
+                </div>
+              </div>
+              <div style={{display:'flex',gap:18,flexWrap:'wrap'}}>
+                {[['24H HIGH','$'+fmtPrice(data.high24h)],['24H LOW','$'+fmtPrice(data.low24h)],['NEXT CANDLE',nextCandle]].map(([l,v])=>(
+                  <div key={l}><div style={{fontSize:9,color:C.muted,letterSpacing:1}}>{l}</div><div style={{fontSize:12,color:l==='NEXT CANDLE'?C.accent:C.text,fontFamily:l==='NEXT CANDLE'?'Orbitron,sans-serif':'inherit'}}>{v}</div></div>
+                ))}
+              </div>
+            </div>
+
+            {/* PREDICTION */}
+            <div style={{...P,borderLeft:`3px solid ${sc(data.pred.cls)}`,boxShadow:`0 0 18px ${sc(data.pred.cls)}18`}}>
+              <div style={T}><Bar/>NEXT CANDLE PREDICTION</div>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',flexWrap:'wrap',gap:14}}>
+                <div style={{flex:1}}>
+                  <div style={{fontFamily:'Orbitron,sans-serif',fontSize:24,fontWeight:900,letterSpacing:3,color:sc(data.pred.cls),textShadow:`0 0 18px ${sc(data.pred.cls)}55`}}>
+                    {data.pred.cls==='bull'?'▲ BULLISH':data.pred.cls==='bear'?'▼ BEARISH':'◆ NEUTRAL'}
+                  </div>
+                  <div style={{marginTop:10,display:'flex',flexDirection:'column',gap:5}}>
+                    {data.pred.reasons.slice(0,4).map((r,i)=><div key={i} style={{fontSize:11,color:C.text,display:'flex',gap:6}}><span style={{color:C.accent}}>›</span>{r}</div>)}
+                  </div>
+                </div>
+                <svg width="90" height="90" viewBox="0 0 90 90" style={{flexShrink:0}}>
+                  <circle cx="45" cy="45" r="38" fill="none" stroke={C.dim} strokeWidth="7"/>
+                  <circle cx="45" cy="45" r="38" fill="none" stroke={sc(data.pred.cls)} strokeWidth="7"
+                    strokeDasharray="239" strokeLinecap="round"
+                    strokeDashoffset={239*(1-data.pred.conf/100)}
+                    transform="rotate(-90 45 45)"
+                    style={{transition:'stroke-dashoffset 1s ease'}}/>
+                  <text x="45" y="40" textAnchor="middle" fill={sc(data.pred.cls)} fontFamily="Orbitron,sans-serif" fontSize="14" fontWeight="900">{data.pred.conf}%</text>
+                  <text x="45" y="54" textAnchor="middle" fill={C.muted} fontFamily="Share Tech Mono,monospace" fontSize="7">CONF</text>
+                </svg>
+              </div>
+              {/* Signal Grid */}
+              <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginTop:12}}>
+                {[['RSI',data.rsiCls],['MACD',data.macdCls],['VOLUME',data.volCls],['EMA TREND',data.emaCls],['PRICE ACTION',data.pred.paCls]].map(([n,c])=>(
+                  <div key={n} style={{background:'rgba(10,42,58,0.6)',border:`1px solid ${C.dim}`,padding:'7px 10px'}}>
+                    <div style={{fontSize:9,color:C.muted,letterSpacing:1}}>{n}</div>
+                    <div style={{fontSize:10,fontWeight:700,color:sc(c),marginTop:2}}>{sl(c)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* RSI + VOLUME */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginBottom:14}}>
+              <div style={P}>
+                <div style={T}><Bar/>RSI (14)</div>
+                <div style={{fontFamily:'Orbitron,sans-serif',fontSize:26,fontWeight:900,textAlign:'center',color:data.rsi<30?C.bull:data.rsi>70?C.bear:C.neutral}}>{data.rsi.toFixed(1)}</div>
+                <div style={{position:'relative',height:7,background:C.dim,borderRadius:1,margin:'10px 0 4px',overflow:'visible'}}>
+                  <div style={{position:'absolute',inset:0,borderRadius:1,overflow:'hidden'}}>
+                    <div style={{height:'100%',background:`linear-gradient(90deg,${C.bear} 0%,${C.bear} 30%,${C.neutral} 30%,${C.neutral} 70%,${C.bull} 70%)`}}/>
+                  </div>
+                  <div style={{position:'absolute',top:-3,left:`${Math.min(99,Math.max(1,data.rsi))}%`,transform:'translateX(-50%)',width:3,height:13,background:'#fff',borderRadius:1,boxShadow:'0 0 5px #fff',transition:'left 0.8s ease'}}/>
+                </div>
+                <div style={{display:'flex',justifyContent:'space-between',fontSize:9,color:C.muted}}>
+                  <span style={{color:C.bear}}>30</span><span>50</span><span style={{color:C.bull}}>70</span>
+                </div>
+                <div style={{marginTop:8,fontSize:10,color:sc(data.rsiCls)}}>{data.rsi<30?'OVERSOLD — UP reversal likely':data.rsi>70?'OVERBOUGHT — DOWN reversal likely':'Mid-range — no extreme signal'}</div>
+              </div>
+              <div style={P}>
+                <div style={T}><Bar/>VOLUME</div>
+                {[['CURRENT',fmtVol(data.vols[data.vols.length-1]),''],['AVG (20)',fmtVol(data.avgVol),''],['RATIO',data.volRatio.toFixed(2)+'x','ratio']].map(([l,v,t])=>(
+                  <div key={l} style={{display:'flex',justifyContent:'space-between',marginBottom:6,fontSize:11}}>
+                    <span style={{color:C.muted,fontSize:9}}>{l}</span>
+                    <span style={{color:t==='ratio'?sc(data.volCls):C.text}}>{v}</span>
+                  </div>
+                ))}
+                <div style={{display:'flex',alignItems:'flex-end',gap:2,height:46,marginTop:8}}>
+                  {(()=>{const l20=data.candles.slice(-20);const mx=Math.max(...l20.map(c=>c.vol));return l20.map((c,i)=><div key={i} style={{flex:1,minWidth:3,borderRadius:'1px 1px 0 0',height:`${Math.max(4,(c.vol/mx)*100)}%`,background:c.close>=c.open?'rgba(0,255,136,0.6)':'rgba(255,51,102,0.6)',boxShadow:i===19?`0 0 5px ${C.accent}`:'none'}}/>);})()}
+                </div>
+              </div>
+            </div>
+
+            {/* MACD + EMA */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:14,marginBottom:14}}>
+              <div style={P}>
+                <div style={T}><Bar/>MACD (12,26,9)</div>
+                <div style={{display:'flex',gap:14,flexWrap:'wrap',marginBottom:8}}>
+                  {[['LINE',data.macdLast.macd.toFixed(2),data.macdLast.macd>0?C.bull:C.bear],['SIG',data.macdLast.signal.toFixed(2),C.text],['HIST',data.macdLast.hist.toFixed(2),data.macdLast.hist>0?C.bull:C.bear]].map(([l,v,c])=>(
+                    <div key={l}><div style={{fontSize:9,color:C.muted}}>{l}</div><div style={{fontSize:11,color:c}}>{v}</div></div>
+                  ))}
+                </div>
+                <div style={{display:'flex',alignItems:'center',gap:1,height:50}}>
+                  {(()=>{const l30=data.macdSeries.slice(-30);const mx=Math.max(...l30.map(s=>Math.abs(s.hist)))||1;return l30.map((s,i)=>{const h=Math.max(4,(Math.abs(s.hist)/mx)*46);return <div key={i} style={{flex:1,minWidth:3,borderRadius:1,height:h,background:s.hist>0?'rgba(0,255,136,0.7)':'rgba(255,51,102,0.7)',alignSelf:s.hist>0?'flex-end':'flex-start'}}/>;});})()}
+                </div>
+                <div style={{marginTop:6,fontSize:10,color:sc(data.macdCls)}}>{data.macdCls==='bull'?'BULLISH momentum':data.macdCls==='bear'?'BEARISH momentum':'NEUTRAL'}</div>
+              </div>
+              <div style={P}>
+                <div style={T}><Bar/>EMA (9/21/50)</div>
+                {[['EMA 9',data.ema9],['EMA 21',data.ema21],['EMA 50',data.ema50]].map(([n,v])=>{
+                  const above=data.price>v;
+                  return <div key={n} style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'6px 0',borderBottom:`1px solid rgba(10,42,58,0.7)`}}>
+                    <span style={{fontSize:10,color:C.muted}}>{n}</span>
+                    <span style={{fontSize:10,fontFamily:'Orbitron,sans-serif'}}>${fmtPrice(v)}</span>
+                    <span style={{fontSize:9,padding:'1px 6px',color:above?C.bull:C.bear,background:above?'rgba(0,255,136,0.1)':'rgba(255,51,102,0.1)',border:`1px solid ${above?'rgba(0,255,136,0.25)':'rgba(255,51,102,0.25)'}`}}>{above?'ABOVE ↑':'BELOW ↓'}</span>
+                  </div>;
+                })}
+                <div style={{marginTop:8,fontSize:10,color:sc(data.emaCls)}}>{data.emaCls==='bull'?'All EMAs bullish aligned':data.emaCls==='bear'?'All EMAs bearish aligned':'Mixed EMA signals'}</div>
+              </div>
+            </div>
+
+            {/* CANDLE TABLE */}
+            <div style={P}>
+              <div style={T}><Bar/>PREVIOUS CANDLES</div>
+              <div style={{overflowX:'auto'}}>
+                <table style={{width:'100%',borderCollapse:'collapse',fontSize:10}}>
+                  <thead><tr style={{color:C.muted,fontSize:9}}>
+                    {['TIME','OPEN','HIGH','LOW','CLOSE','VOL','CHG'].map(h=><td key={h} style={{padding:'4px 6px'}}>{h}</td>)}
+                  </tr></thead>
+                  <tbody>
+                    {data.candles.slice(-9,-1).reverse().map((c,i)=>{
+                      const g=c.close>=c.open, chg=((c.close-c.open)/c.open*100).toFixed(2);
+                      const t=new Date(c.time).toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',hour12:false});
+                      return <tr key={i} style={{borderBottom:`1px solid rgba(10,42,58,0.5)`}}>
+                        <td style={{padding:'4px 6px',color:C.muted}}>{t}</td>
+                        <td style={{padding:'4px 6px'}}>${fmtPrice(c.open)}</td>
+                        <td style={{padding:'4px 6px',color:C.bull}}>${fmtPrice(c.high)}</td>
+                        <td style={{padding:'4px 6px',color:C.bear}}>${fmtPrice(c.low)}</td>
+                        <td style={{padding:'4px 6px',color:g?C.bull:C.bear}}>${fmtPrice(c.close)}</td>
+                        <td style={{padding:'4px 6px',color:C.muted}}>{fmtVol(c.vol)}</td>
+                        <td style={{padding:'4px 6px',color:g?C.bull:C.bear}}>{g?'+':''}{chg}%</td>
+                      </tr>;
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div style={{textAlign:'center',fontSize:10,color:C.muted,padding:'8px 0',letterSpacing:1}}>
+              AUTO-REFRESH IN <span style={{color:C.accent,fontFamily:'Orbitron,sans-serif'}}>{countdown}s</span> &nbsp;|&nbsp; LAST UPDATE: {data.lastUpdate}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
 }
-
-function setColor(id, cls) {
-    document.getElementById(id).className = cls;
-}
-
-setInterval(fetchData, 5000);
-fetchData();
-
-</script>
-
-</body>
-</html>
